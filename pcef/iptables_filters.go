@@ -2,20 +2,17 @@ package pcef
 
 import (
 	log "github.com/sirupsen/logrus"
-	"os/exec"
-	"strings"
 	"net"
+	"os/exec"
 	"pcef_interface"
+	"strings"
 )
 
-
 type iptables_filters struct {
-	// iptables_filters	
+	// iptables_filters
 }
 
-
-
-func (i iptables_filters)ForwardingFilterPresent(addr net.IP) bool {
+func (i iptables_filters) ForwardingFilterPresent(addr net.IP) bool {
 	// IPTables holds state outside the lifetime of this program. The `-C` option will return success if the rule is
 	// present, and 1 if it is not.
 	cmd := exec.Command("iptables", "-C", "FORWARD", "-s", addr.String(), "-j", "REJECT")
@@ -59,4 +56,3 @@ func (i iptables_filters) DisableForwardingFilter(addr net.IP) {
 		log.WithField("stdio", strings.TrimSpace(string(output))).Infof("Iptables generated output")
 	}
 }
-

@@ -1,14 +1,15 @@
 package tdf
 
 import (
-	"time"
 	"sync"
+	"time"
 
-	"github.com/uw-ictd/haulage/internal/classify"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap""
-	"gopkg.in/yaml.v2"
+	"github.com/google/gopacket/pcap"
+	log "github.com/sirupsen/logrus"
+	"github.com/uw-ictd/haulage/internal/classify"
+	"github.com/uw-ictd/haulage/internal/types"
 )
 
 type FlowType int
@@ -37,42 +38,43 @@ type FlowEvent struct {
 }
 
 type TrafficDetector struct {
-	config Config
-	handle *pcap.Handle
-	waitGroup *sync.WaitGroup
-	flowHandlers map[FiveTuple]chan FlowEvent
-	flowMux sync.Mutex
+	handle          *pcap.Handle
+	waitGroup       sync.WaitGroup
+	flowHandlers    map[classify.FiveTuple]chan FlowEvent
+	flowMux         sync.Mutex
 	userAggregators map[gopacket.Endpoint]chan UsageEvent
-	usageMux sync.Mutex
+	usageMux        sync.Mutex
+	flowLogInterval time.Duration
+	userLogInterval time.Duration
 }
 
 type Config struct {
-	FlowLogInterval time.Duration `yaml:"flowLogInterval"`
-	UserLogInterval time.Duration `yaml:"userLogInterval"`
-	Interface       string        `yaml:"interface"`
-	Custom          CustomConfig  `yaml:"custom"`
+	FlowLogInterval time.Duration      `yaml:"flowLogInterval"`
+	UserLogInterval time.Duration      `yaml:"userLogInterval"`
+	Interface       string             `yaml:"interface"`
 }
 
 /** Creates a Traffic Detector based around the given config */
-func CreateTDF(config Config, waitGroup *sync.WaitGroup) (TrafficDetector, error) {
-	var tdf TDF
-	tdf.config = config
-	tdf.flowHandlers = make(map[FiveTuple]chan FlowEvent)
+func CreateTDF(config Config, waitGroup sync.WaitGroup) (TrafficDetector, error) {
+	var tdf TrafficDetector
+	tdf.flowLogInterval = config.FlowLogInterval
+	tdf.userLogInterval = config.UserLogInterval
+	tdf.flowHandlers = make(map[classify.FiveTuple]chan FlowEvent)
 	tdf.userAggregators = make(map[gopacket.Endpoint]chan UsageEvent)
 	// Open device
-	handle, err = pcap.OpenLive(config.Interface, SNAPSHOT_LEN, PROMISCUOUS, SNAPSHOT_TIMEOUT)
+	handle, err := pcap.OpenLive(config.Interface, SNAPSHOT_LEN, PROMISCUOUS, SNAPSHOT_TIMEOUT)
 	// Open file
 	// handle, err = pcap.OpenOffline("testdata/small.pcap")
 	if err != nil {
 		log.Fatal(err)
-	}  else {
+	} else {
 		tdf.handle = handle
 	}
-	return (tdf, err)
+	return tdf, err
 }
 
 /** Starts collecting packets from the Interface given when created */
-func (tdf TrafficDetector) StartDetection() {
+func (tdf *TrafficDetector) StartDetection() {
 	// Skip directly to decoding IPv4 on the tunneled packets.
 	// TODO Make this smarter to use ip4 or ip6 based on the tunnel address and type?
 	layers.LinkTypeMetadata[12] = layers.EnumMetadata{
@@ -84,29 +86,27 @@ func (tdf TrafficDetector) StartDetection() {
 	packetSource := gopacket.NewPacketSource(tdf.handle, tdf.handle.LinkType())
 	for packet := range packetSource.Packets() {
 		// Do something with a packet here.
-		classifyPacket(packet, &processingGroup)
+		tdf.classifyPacket(packet)
 	}
 }
 
-// Parse the network layer of the packet and push it to the appropriate channel for each flow.
-func (tdf TrafficDetector) classifyPacket(packet gopacket.Packet) {
+// Parse the network layer of the packet and push it to the appropriate channel 
+// for each flow.
+func (tdf *TrafficDetector) classifyPacket(packet gopacket.Packet) {
 	// Only support ethernet link layers.
-	if (packet.LinkLayer() != nil) && 
-	   (packet.LinkLayer().LayerType() != layers.LayerTypeEthernet) {
-		log.WithField("LayerType", packet.LinkLayer().LayerType())
-		   .Info("Non-ethernet is not supported")
+	if (packet.LinkLayer() != nil) &&
+		(packet.LinkLayer().LayerType() != layers.LayerTypeEthernet) {
+		log.WithField("LayerType", packet.LinkLayer().LayerType()).Info("Non-ethernet is not supported")
 		return
 	}
 
 	if packet.NetworkLayer() == nil {
-		log.WithField("Packet", packet)
-		   .Debug("Packet has no network layer and will not be counted")
+		log.WithField("Packet", packet).Debug("Packet has no network layer and will not be counted")
 		return
 	}
 
 	if packet.TransportLayer() == nil {
-		log.WithField("Packet", packet)
-		   .Debug("Packet has no transport layer and will not be counted")
+		log.WithField("Packet", packet).Debug("Packet has no transport layer and will not be counted")
 		return
 	}
 
@@ -144,50 +144,52 @@ func (tdf TrafficDetector) classifyPacket(packet gopacket.Packet) {
 	flow := classify.FiveTuple{
 		Network:           packet.NetworkLayer().NetworkFlow(),
 		Transport:         packet.TransportLayer().TransportFlow(),
-		TransportProtocol: transportProtocol
+		TransportProtocol: transportProtocol,
 	}
 
-    bytesUsed := len(packet.NetworkLayer().LayerPayload())
+	bytesUsed := len(packet.NetworkLayer().LayerPayload())
 	tdf.sendToFlowHandler(FlowEvent{flow, bytesUsed})
-	var msg classify.DnsMsg
-	if err := classify.ParseDns(packet, flow, &msg); err == nil {
-		// Errors are expected, since most packets are not valid DNS.
-		LogDNS(&msg, tdf.waitGroup)
-	}
+	// This was logging DNS messages to the SQL database, which is not part of
+	// the tdf functionality.  Maybe NetFlow will do similar logging?
+	//
+	// var msg classify.DnsMsg
+	// if err := classify.ParseDns(packet, flow, &msg); err == nil {
+	// 	// Errors are expected, since most packets are not valid DNS.
+	// 	LogDNS(&msg, tdf.waitGroup)
+	// }
 }
 
-func (tdf TrafficDetector) sendToFlowHandler(event FlowEvent) {
+func (tdf *TrafficDetector) sendToFlowHandler(event FlowEvent) {
 	tdf.flowMux.Lock()
 	canonicalFlow := event.flow.MakeCanonical()
 	flowChannel, channelExists := tdf.flowHandlers[canonicalFlow]
 
 	if !channelExists {
-		flowChannel = make(chan FlowEvent) 
+		flowChannel = make(chan FlowEvent)
 		tdf.flowHandlers[canonicalFlow] = make(chan FlowEvent)
 		tdf.waitGroup.Add(1)
-		go tdf.flowHandler(newChannel, event.flow)
+		go tdf.flowHandler(flowChannel, event.flow)
 	}
 	tdf.flowMux.Unlock()
 
 	flowChannel <- event
 }
 
-func (tdf TrafficDetector) flowHandler(ch chan flowEvent, flow classify.FiveTuple) {
+func (tdf *TrafficDetector) flowHandler(ch chan FlowEvent, flow classify.FiveTuple) {
 	defer tdf.cleanupFlow(ch, flow)
 	// The flow logger will receive events from both A->B and B->A
 	endNetA := flow.Network.Src()
 	endTransportA := flow.Transport.Src()
 	bytesAB := 0
 	bytesBA := 0
-	intervalStart := time.Now()
-	ticker := time.NewTicker(config.FlowLogInterval)
+	ticker := time.NewTicker(tdf.flowLogInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case event := <-ch:
-			if (event.flow.Network.Src() == endNetA) && 
-			   (event.flow.Transport.Src() == endTransportA) {
+			if (event.flow.Network.Src() == endNetA) &&
+				(event.flow.Transport.Src() == endTransportA) {
 				bytesAB += event.amount
 			} else {
 				bytesBA += event.amount
@@ -201,18 +203,7 @@ func (tdf TrafficDetector) flowHandler(ch chan flowEvent, flow classify.FiveTupl
 				log.WithField("Flow", flow).Debug("Reclaiming")
 				return
 			}
-
-			intervalEnd := time.Now()
-			tdf.waitGroup.Add(1)
-			// TODO(matt9j) Sniff and lookup the hostnames as needed.
-			go LogFlowPeriodic(intervalStart, 
-							   intervalEnd, 
-							   flow, 
-							   bytesAB, 
-							   bytesBA, 
-							   tdf.waitGroup)
 			
-			intervalStart = intervalEnd
 			log.WithField("Flow", flow).Debug(bytesAB, bytesBA)
 			bytesAB = 0
 			bytesBA = 0
@@ -220,7 +211,7 @@ func (tdf TrafficDetector) flowHandler(ch chan flowEvent, flow classify.FiveTupl
 	}
 }
 
-func (tdf TrafficDetector) cleanupFlow(ch chan FlowEvent, flow FiveTuple ) {
+func (tdf *TrafficDetector) cleanupFlow(ch chan FlowEvent, flow classify.FiveTuple) {
 	tdf.waitGroup.Done()
 	close(ch)
 	tdf.flowMux.Lock()
@@ -228,12 +219,12 @@ func (tdf TrafficDetector) cleanupFlow(ch chan FlowEvent, flow FiveTuple ) {
 	tdf.flowMux.Unlock()
 }
 
-func (tdf TrafficDetector) generateUsageEvents(flow gopacket.Flow, amount int) {
+func (tdf *TrafficDetector) generateUsageEvents(flow gopacket.Flow, amount int) {
 	if classify.User(flow.Src()) {
 		if classify.Local(flow.Dst()) {
-			tdf.sendToUserAggregator(flow.Src(), usageEvent{LOCAL_UP, amount})
+			tdf.sendToUserAggregator(flow.Src(), UsageEvent{LOCAL_UP, amount})
 		} else {
-			tdf.sendToUserAggregator(flow.Src(), usageEvent{EXT_UP, amount})
+			tdf.sendToUserAggregator(flow.Src(), UsageEvent{EXT_UP, amount})
 		}
 	}
 
@@ -246,8 +237,8 @@ func (tdf TrafficDetector) generateUsageEvents(flow gopacket.Flow, amount int) {
 	}
 }
 
-func (tdf TrafficDetector) sendToUserAggregator(user gopacket.Endpoint, event UsageEvent) {
-	tdf.usageMux.lock()
+func (tdf *TrafficDetector) sendToUserAggregator(user gopacket.Endpoint, event UsageEvent) {
+	tdf.usageMux.Lock()
 	userChannel, ok := tdf.userAggregators[user]
 
 	if !ok {
@@ -260,17 +251,18 @@ func (tdf TrafficDetector) sendToUserAggregator(user gopacket.Endpoint, event Us
 	userChannel <- event
 }
 
-// Todo: reimplement this with the radius/netflow functionality
-func (tdf TrafficDetector) aggregateUser(ch chan UsageEvent, user gopacket.Endpoint) {
+func (tdf *TrafficDetector) aggregateUser(ch chan UsageEvent, user gopacket.Endpoint) {
 	defer tdf.cleanupAggregator(ch, user)
 	localUpBytes := int64(0)
 	localDownBytes := int64(0)
 	extUpBytes := int64(0)
 	extDownBytes := int64(0)
-	logTick := time.NewTicker(config.UserLogInterval)
+	logTick := time.NewTicker(tdf.userLogInterval)
 	defer logTick.Stop()
-	customContext := UserContext{DataBalance: 0}
-	customContext.Init(user)
+
+	// Keep track of the user and how much data they've used
+	customContext := types.UserContext{DataBalance: 0}
+	//customContext.Init(user)
 
 	for {
 		select {
@@ -290,7 +282,7 @@ func (tdf TrafficDetector) aggregateUser(ch chan UsageEvent, user gopacket.Endpo
 			// TODO(gh/8) Reduce duplication below with user context cleanup.
 			if customContext.ShouldLogNow(extUpBytes + extDownBytes) {
 				log.WithField("User", user).Debug(localUpBytes, localDownBytes, extUpBytes, extDownBytes)
-				LogUserPeriodic(user, localUpBytes, localDownBytes, extUpBytes, extDownBytes)
+				tdf.sendUsage(user, localUpBytes, localDownBytes, extUpBytes, extDownBytes)
 				localUpBytes = 0
 				localDownBytes = 0
 				extUpBytes = 0
@@ -303,7 +295,7 @@ func (tdf TrafficDetector) aggregateUser(ch chan UsageEvent, user gopacket.Endpo
 				return
 			}
 			log.WithField("User", user).Debug(localUpBytes, localDownBytes, extUpBytes, extDownBytes)
-			LogUserPeriodic(user, localUpBytes, localDownBytes, extUpBytes, extDownBytes)
+			tdf.sendUsage(user, localUpBytes, localDownBytes, extUpBytes, extDownBytes)
 			localUpBytes = 0
 			localDownBytes = 0
 			extUpBytes = 0
@@ -312,7 +304,12 @@ func (tdf TrafficDetector) aggregateUser(ch chan UsageEvent, user gopacket.Endpo
 	}
 }
 
-func (tdf TrafficDetector) deleteAggregator(ch chan UsageEvent, user gopacket.Endpoint) {
+func (tdf *TrafficDetector) sendUsage(user gopacket.Endpoint, localUpBytes int64, localDownBytes int64, extUpBytes int64, extDownBytes int64) {
+	// Need to implement radius/netflow communication here
+	log.Error("Send usage isn't implemented")
+}
+
+func (tdf *TrafficDetector) cleanupAggregator(ch chan UsageEvent, user gopacket.Endpoint) {
 	tdf.waitGroup.Done()
 	close(ch)
 	tdf.usageMux.Lock()
@@ -320,6 +317,6 @@ func (tdf TrafficDetector) deleteAggregator(ch chan UsageEvent, user gopacket.En
 	tdf.usageMux.Unlock()
 }
 
-func (tdf TrafficDetector) Close() {
+func (tdf *TrafficDetector) Close() {
 	tdf.handle.Close()
 }

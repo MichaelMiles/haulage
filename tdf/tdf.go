@@ -8,8 +8,8 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	log "github.com/sirupsen/logrus"
-	"github.com/uw-ictd/haulage/internal/classify"
-	"github.com/uw-ictd/haulage/internal/types"
+	"github.com/uw-ictd/haulage/tdf/internal/classify"
+	"github.com/uw-ictd/haulage/tdf/internal/types"
 )
 
 type FlowType int

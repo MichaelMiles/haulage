@@ -1,9 +1,13 @@
 package tdf
 
 import (
+	"context"
+	"fmt"
 	"sync"
 	"time"
 
+	"layeh.com/radius"
+	"layeh.com/radius/rfc2865"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
@@ -203,7 +207,7 @@ func (tdf *TrafficDetector) flowHandler(ch chan FlowEvent, flow classify.FiveTup
 				log.WithField("Flow", flow).Debug("Reclaiming")
 				return
 			}
-			
+
 			log.WithField("Flow", flow).Debug(bytesAB, bytesBA)
 			bytesAB = 0
 			bytesBA = 0
@@ -305,8 +309,13 @@ func (tdf *TrafficDetector) aggregateUser(ch chan UsageEvent, user gopacket.Endp
 }
 
 func (tdf *TrafficDetector) sendUsage(user gopacket.Endpoint, localUpBytes int64, localDownBytes int64, extUpBytes int64, extDownBytes int64) {
-	// Need to implement radius/netflow communication here
-	log.Error("Send usage isn't implemented")
+	packet := radius.New(radius.CodeAccessRequest, []byte(`secret`))
+	rfc2865.UserName_SetString(packet, user.String())
+	rfc2865.State_AddString(packet, fmt.Sprintf("%d,%d,%d,%d", localUpBytes, localDownBytes, extUpBytes, extDownBytes))
+	_, err := radius.Exchange(context.Background(), packet, "localhost:1813")
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
 func (tdf *TrafficDetector) cleanupAggregator(ch chan UsageEvent, user gopacket.Endpoint) {

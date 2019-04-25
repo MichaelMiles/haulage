@@ -2,7 +2,7 @@ package tdf
 
 import (
 	"context"
-	"fmt"
+	"encoding/binary"
 	"sync"
 	"time"
 
@@ -311,7 +311,12 @@ func (tdf *TrafficDetector) aggregateUser(ch chan UsageEvent, user gopacket.Endp
 func (tdf *TrafficDetector) sendUsage(user gopacket.Endpoint, localUpBytes int64, localDownBytes int64, extUpBytes int64, extDownBytes int64) {
 	packet := radius.New(radius.CodeAccessRequest, []byte(`secret`))
 	rfc2865.UserName_SetString(packet, user.String())
-	rfc2865.State_AddString(packet, fmt.Sprintf("%d,%d,%d,%d", localUpBytes, localDownBytes, extUpBytes, extDownBytes))
+	dataBytes := make([]byte, 32)
+	binary.LittleEndian.PutUint64(dataBytes[0:8], uint64(localUpBytes))
+	binary.LittleEndian.PutUint64(dataBytes[8:16], uint64(localDownBytes))
+	binary.LittleEndian.PutUint64(dataBytes[16:24], uint64(extUpBytes))
+	binary.LittleEndian.PutUint64(dataBytes[24:32], uint64(extDownBytes))
+	rfc2865.State_Set(packet, dataBytes)
 	_, err := radius.Exchange(context.Background(), packet, "localhost:1813")
 	if err != nil {
 		log.Fatal(err)
